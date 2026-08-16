@@ -1,0 +1,13 @@
+order_id,order_date,product,category,region,quantity,unit_price,unit_cost
+1001,2026-01-05,Laptop,Electronics,Yangon,2,850,700
+1002,2026-01-07,Mouse,Accessories,Mandalay,5,20,12
+1003,2026-02-02,Keyboard,Accessories,Yangon,3,45,30
+1004,2026-02-10,Monitor,Electronics,Naypyidaw,2,240,190
+1005,2026-03-01,Laptop,Electronics,Mandalay,1,850,700
+1006,2026-03-08,Mouse,Accessories,Yangon,8,20,12
+1007,2026-04-03,Monitor,Electronics,Yangon,3,240,190
+1008,2026-04-15,Keyboard,Accessories,Mandalay,4,45,30
+1009,2026-05-06,Laptop,Electronics,Yangon,2,850,700
+1010,2026-05-20,Mouse,Accessories,Naypyidaw,6,20,12
+1010,2026-05-20,Mouse,Accessories,Naypyidaw,6,20,12
+1011,2026-06-03,Keyboard,Accessories,,2,45,30
