@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -66,19 +67,54 @@ SORT_MAP = {
 }
 
 
-RESPONSE_LANGUAGE_OPTIONS = {
-    "Same as question": "same",
-    "English": "en",
-    "မြန်မာ": "my",
-    "Bilingual": "bilingual",
-}
+RESPONSE_LANGUAGE_OPTIONS = [
+    "Same as question",
+    "English",
+    "မြန်မာ",
+    "Bilingual",
+]
+
+
+def make_arrow_safe(value: Any) -> Any:
+    """Convert nested or mixed Python values into Arrow-safe values."""
+
+    if isinstance(value, set):
+        value = list(value)
+
+    if isinstance(value, (list, dict, tuple)):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    if isinstance(value, Path):
+        return str(value)
+
+    return value
+
+
+def make_dataframe_arrow_safe(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return a copy whose object columns are safe for Streamlit/PyArrow."""
+
+    safe_dataframe = dataframe.copy()
+
+    for column in safe_dataframe.columns:
+        if safe_dataframe[column].dtype == "object":
+            safe_dataframe[column] = safe_dataframe[column].apply(
+                make_arrow_safe
+            )
+
+    return safe_dataframe
 
 
 def convert_hybrid_plan(
     question: str,
     hybrid_result: dict[str, Any],
 ) -> AnalysisPlan:
-    """Convert rule-based or local-LLM output to the shared AnalysisPlan."""
+    """Convert rule-based or local-LLM output into AnalysisPlan."""
 
     plan_data = hybrid_result["plan"]
 
@@ -86,7 +122,9 @@ def convert_hybrid_plan(
         return AnalysisPlan.model_validate(plan_data)
 
     intent_name = str(plan_data.get("intent", "unknown"))
-    visualization_name = str(plan_data.get("visualization", "table"))
+    visualization_name = str(
+        plan_data.get("visualization", "table")
+    )
     sort_name = plan_data.get("sort_direction")
 
     filters = [
@@ -106,11 +144,10 @@ def convert_hybrid_plan(
             "The local model did not identify a metric."
         )
 
-    if intent_name in {
-        "ranking",
-        "trend",
-        "comparison",
-    } and dimension is None:
+    if (
+        intent_name in {"ranking", "trend", "comparison"}
+        and dimension is None
+    ):
         warnings.append(
             "The local model did not identify a dimension."
         )
@@ -120,8 +157,6 @@ def convert_hybrid_plan(
             "Anomaly execution is not implemented yet. "
             "The plan requires manual review."
         )
-
-    confidence = 1.0 if not warnings else 0.65
 
     return AnalysisPlan(
         original_question=question.strip(),
@@ -145,7 +180,7 @@ def convert_hybrid_plan(
             VisualizationType.TABLE,
         ),
         filters=filters,
-        confidence=confidence,
+        confidence=1.0 if not warnings else 0.65,
         warnings=warnings,
     )
 
@@ -153,7 +188,7 @@ def convert_hybrid_plan(
 def metric_value_from_result(
     result_records: list[dict[str, Any]],
 ) -> float | int | None:
-    """Return a summary value when an execution result contains one."""
+    """Extract a KPI value from a one-row summary result."""
 
     if len(result_records) != 1:
         return None
@@ -167,7 +202,7 @@ def metric_value_from_result(
 
 
 def format_number(value: float | int) -> str:
-    """Format a number for a KPI card."""
+    """Format a number for Streamlit KPI display."""
 
     if isinstance(value, float) and not value.is_integer():
         return f"{value:,.2f}"
@@ -178,21 +213,23 @@ def format_number(value: float | int) -> str:
 def display_analysis_result(
     result: Any,
     analysis_plan: AnalysisPlan,
-    source: str,
+    parser_source: str,
 ) -> None:
-    """Display analysis output, evidence, warnings, and CSV export."""
+    """Display results, filter evidence, validation, and CSV export."""
 
     analysis = result.analysis
-    result_records = analysis["result"]
-    result_df = pd.DataFrame(result_records)
+    result_records = analysis.get("result", [])
+    result_df = make_dataframe_arrow_safe(
+        pd.DataFrame(result_records)
+    )
 
-    st.subheader("Analysis result")
+    st.subheader("Analysis Result")
 
     source_label = {
         "rule_based": "Deterministic rule parser",
         "local_llm": "Local Qwen3 4B fallback",
         "rule_based_fallback": "Rule parser after LLM failure",
-    }.get(source, source)
+    }.get(parser_source, parser_source)
 
     col_1, col_2, col_3, col_4 = st.columns(4)
     col_1.metric("Parser source", source_label)
@@ -204,7 +241,9 @@ def display_analysis_result(
 
     if summary_value is not None:
         st.metric(
-            label=(analysis_plan.metric or "Result").replace("_", " ").title(),
+            label=(
+                analysis_plan.metric or "Result"
+            ).replace("_", " ").title(),
             value=format_number(summary_value),
         )
 
@@ -215,19 +254,24 @@ def display_analysis_result(
             hide_index=True,
         )
 
-        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = result_df.to_csv(index=False).encode(
+            "utf-8-sig"
+        )
 
         st.download_button(
-            label="Download result CSV",
+            label="Download Result CSV",
             data=csv_bytes,
             file_name="insightflow_analysis_result.csv",
             mime="text/csv",
         )
 
     if result.applied_filters:
-        st.subheader("Applied filters")
+        st.subheader("Applied Filters")
+        filter_df = make_dataframe_arrow_safe(
+            pd.DataFrame(result.applied_filters)
+        )
         st.dataframe(
-            pd.DataFrame(result.applied_filters),
+            filter_df,
             use_container_width=True,
             hide_index=True,
         )
@@ -238,14 +282,14 @@ def display_analysis_result(
     for warning in analysis.get("warnings", []):
         st.warning(warning)
 
-    with st.expander("Calculation and validation evidence"):
+    with st.expander("Calculation and Validation Evidence"):
         st.write(
             "**Calculation:**",
             analysis.get("calculation") or "Not applicable",
         )
         st.json(analysis.get("validation", {}))
 
-    with st.expander("Detected analysis plan"):
+    with st.expander("Detected Analysis Plan"):
         st.json(analysis_plan.model_dump(mode="json"))
 
 
@@ -292,8 +336,14 @@ st.success(f"Successfully loaded: {uploaded_file.name}")
 metric_1, metric_2, metric_3, metric_4 = st.columns(4)
 metric_1.metric("Rows", f"{profile['row_count']:,}")
 metric_2.metric("Columns", f"{profile['column_count']:,}")
-metric_3.metric("Duplicate rows", f"{profile['duplicate_rows']:,}")
-metric_4.metric("Quality score", f"{profile['quality_score']}%")
+metric_3.metric(
+    "Duplicate rows",
+    f"{profile['duplicate_rows']:,}",
+)
+metric_4.metric(
+    "Quality score",
+    f"{profile['quality_score']}%",
+)
 
 
 preview_tab, quality_tab, ask_tab = st.tabs(
@@ -307,14 +357,17 @@ preview_tab, quality_tab, ask_tab = st.tabs(
 
 with preview_tab:
     st.dataframe(
-        dataframe.head(100),
+        make_dataframe_arrow_safe(dataframe.head(100)),
         use_container_width=True,
     )
 
 
 with quality_tab:
-    schema_df = pd.DataFrame(profile["columns"])
-    st.write("### Detected schema")
+    schema_df = make_dataframe_arrow_safe(
+        pd.DataFrame(profile["columns"])
+    )
+
+    st.write("### Detected Schema")
     st.dataframe(
         schema_df,
         use_container_width=True,
@@ -324,7 +377,9 @@ with quality_tab:
     missing_df = pd.DataFrame(
         {
             "column": profile["missing_by_column"].keys(),
-            "missing_count": profile["missing_by_column"].values(),
+            "missing_count": profile[
+                "missing_by_column"
+            ].values(),
         }
     )
     missing_df["missing_percentage"] = (
@@ -333,7 +388,7 @@ with quality_tab:
         * 100
     ).round(2)
 
-    st.write("### Missing values")
+    st.write("### Missing Values")
     st.dataframe(
         missing_df.sort_values(
             by="missing_count",
@@ -342,6 +397,9 @@ with quality_tab:
         use_container_width=True,
         hide_index=True,
     )
+
+    with st.expander("Complete Profile JSON"):
+        st.json(profile)
 
 
 with ask_tab:
@@ -361,24 +419,27 @@ with ask_tab:
 
     response_language = st.selectbox(
         "Response language",
-        options=list(RESPONSE_LANGUAGE_OPTIONS.keys()),
+        options=RESPONSE_LANGUAGE_OPTIONS,
     )
 
     analyze_clicked = st.button(
         "Analyze",
         type="primary",
-        use_container_width=False,
     )
 
     if analyze_clicked:
         if not user_problem.strip():
-            st.warning("Enter an analytical problem before continuing.")
+            st.warning(
+                "Enter an analytical problem before continuing."
+            )
         else:
             try:
                 with st.spinner(
                     "Understanding the question and running the analysis..."
                 ):
-                    hybrid_result = parse_question_hybrid(user_problem)
+                    hybrid_result = parse_question_hybrid(
+                        user_problem
+                    )
                     analysis_plan = convert_hybrid_plan(
                         user_problem,
                         hybrid_result,
@@ -408,13 +469,13 @@ with ask_tab:
                 display_analysis_result(
                     result=result,
                     analysis_plan=analysis_plan,
-                    source=hybrid_result["source"],
+                    parser_source=hybrid_result["source"],
                 )
 
                 if hybrid_result.get("llm_error"):
                     st.warning(
-                        "The local LLM was unavailable, so the rule-based "
-                        "plan was used. "
+                        "The local LLM was unavailable, so the "
+                        "rule-based plan was used. "
                         f"Details: {hybrid_result['llm_error']}"
                     )
 
