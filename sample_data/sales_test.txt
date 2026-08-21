@@ -1,0 +1,3 @@
+﻿product|region|quantity|unit_price|unit_cost
+Laptop|Yangon|2|850|700
+Mouse|Mandalay|5|20|12
