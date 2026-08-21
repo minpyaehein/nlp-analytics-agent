@@ -1,5 +1,7 @@
 """Rule-based bilingual analytics question parser."""
 
+from __future__ import annotations
+
 import re
 
 from app.models.analysis_plan import (
@@ -50,6 +52,17 @@ METRIC_KEYWORDS: dict[str, list[str]] = {
         "purchase price",
         "cost",
     ],
+    "order_count": [
+        "order count",
+        "number of orders",
+        "total orders",
+        "orders",
+    ],
+    "customer_count": [
+        "customer count",
+        "number of customers",
+        "total customers",
+    ],
 }
 
 
@@ -61,6 +74,7 @@ DIMENSION_KEYWORDS: dict[str, list[str]] = {
         "items",
     ],
     "category": [
+        "product category",
         "category",
         "categories",
     ],
@@ -72,45 +86,139 @@ DIMENSION_KEYWORDS: dict[str, list[str]] = {
         "area",
         "areas",
     ],
+    "customer": [
+        "customer",
+        "customers",
+        "client",
+        "clients",
+    ],
     "month": [
         "monthly",
+        "by month",
         "month",
         "months",
     ],
+    "quarter": [
+        "quarterly",
+        "by quarter",
+        "quarter",
+        "quarters",
+    ],
     "year": [
         "yearly",
+        "annually",
         "annual",
+        "by year",
         "year",
         "years",
     ],
     "order_date": [
         "order date",
+        "transaction date",
+        "sale date",
         "date",
+    ],
+    "channel": [
+        "sales channel",
+        "channel",
+        "channels",
+        "platform",
     ],
 }
 
 
 LOCATION_KEYWORDS: dict[str, list[str]] = {
-    "Yangon": ["yangon", "ရန်ကုန်"],
-    "Mandalay": ["mandalay", "မန္တလေး"],
-    "Naypyidaw": ["naypyidaw", "nay pyi taw", "နေပြည်တော်"],
-    "Bago": ["bago", "ပဲခူး"],
-    "Mon": ["mon state", "မွန်ပြည်နယ်"],
-    "Kayin": ["kayin state", "ကရင်ပြည်နယ်"],
-    "Shan": ["shan state", "ရှမ်းပြည်နယ်"],
-    "Rakhine": ["rakhine state", "ရခိုင်ပြည်နယ်"],
-    "Ayeyarwady": ["ayeyarwady", "irrawaddy", "ဧရာဝတီ"],
-    "Sagaing": ["sagaing", "စစ်ကိုင်း"],
-    "Magway": ["magway", "မကွေး"],
-    "Tanintharyi": ["tanintharyi", "တနင်္သာရီ"],
-    "Kachin": ["kachin", "ကချင်"],
-    "Chin": ["chin state", "ချင်းပြည်နယ်"],
-    "Kayah": ["kayah", "ကယား"],
+    "Yangon": [
+        "yangon",
+        "ရန်ကုန်တိုင်းဒေသကြီး",
+        "ရန်ကုန်တိုင်း",
+        "ရန်ကုန်ဒေသ",
+        "ရန်ကုန်",
+    ],
+    "Mandalay": [
+        "mandalay",
+        "မန္တလေးတိုင်းဒေသကြီး",
+        "မန္တလေးတိုင်း",
+        "မန္တလေးဒေသ",
+        "မန္တလေး",
+    ],
+    "Naypyidaw": [
+        "naypyidaw",
+        "nay pyi taw",
+        "နေပြည်တော်ဒေသ",
+        "နေပြည်တော်",
+    ],
+    "Bago": [
+        "bago",
+        "ပဲခူးတိုင်းဒေသကြီး",
+        "ပဲခူးတိုင်း",
+        "ပဲခူး",
+    ],
+    "Mon": [
+        "mon state",
+        "မွန်ပြည်နယ်",
+        "မွန်",
+    ],
+    "Kayin": [
+        "kayin state",
+        "ကရင်ပြည်နယ်",
+        "ကရင်",
+    ],
+    "Shan": [
+        "shan state",
+        "ရှမ်းပြည်နယ်",
+        "ရှမ်း",
+    ],
+    "Rakhine": [
+        "rakhine state",
+        "ရခိုင်ပြည်နယ်",
+        "ရခိုင်",
+    ],
+    "Ayeyarwady": [
+        "ayeyarwady",
+        "irrawaddy",
+        "ဧရာဝတီတိုင်းဒေသကြီး",
+        "ဧရာဝတီတိုင်း",
+        "ဧရာဝတီ",
+    ],
+    "Sagaing": [
+        "sagaing",
+        "စစ်ကိုင်းတိုင်းဒေသကြီး",
+        "စစ်ကိုင်းတိုင်း",
+        "စစ်ကိုင်း",
+    ],
+    "Magway": [
+        "magway",
+        "မကွေးတိုင်းဒေသကြီး",
+        "မကွေးတိုင်း",
+        "မကွေး",
+    ],
+    "Tanintharyi": [
+        "tanintharyi",
+        "တနင်္သာရီတိုင်းဒေသကြီး",
+        "တနင်္သာရီတိုင်း",
+        "တနင်္သာရီ",
+    ],
+    "Kachin": [
+        "kachin state",
+        "ကချင်ပြည်နယ်",
+        "ကချင်",
+    ],
+    "Chin": [
+        "chin state",
+        "ချင်းပြည်နယ်",
+        "ချင်း",
+    ],
+    "Kayah": [
+        "kayah state",
+        "ကယားပြည်နယ်",
+        "ကယား",
+    ],
 }
 
 
-def _contains(text: str, keyword: str) -> bool:
-    """Return True when a complete keyword occurs in text."""
+def contains_keyword(text: str, keyword: str) -> bool:
+    """Return True when a complete English or Myanmar keyword occurs."""
 
     normalized_text = text.casefold()
     normalized_keyword = keyword.casefold().strip()
@@ -128,7 +236,12 @@ def _contains(text: str, keyword: str) -> bool:
     if contains_myanmar:
         return normalized_keyword in normalized_text
 
-    pattern = rf"(?<![A-Za-z0-9_]){re.escape(normalized_keyword)}(?![A-Za-z0-9_])"
+    pattern = (
+        rf"(?<![A-Za-z0-9_])"
+        rf"{re.escape(normalized_keyword)}"
+        rf"(?![A-Za-z0-9_])"
+    )
+
     return re.search(pattern, normalized_text) is not None
 
 
@@ -143,17 +256,21 @@ def find_keyword_mapping(
         for canonical_name, keywords in keyword_map.items()
         for keyword in keywords
     ]
-    mappings.sort(key=lambda item: len(item[1]), reverse=True)
+
+    mappings.sort(
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )
 
     for canonical_name, keyword in mappings:
-        if _contains(text, keyword):
+        if contains_keyword(text, keyword):
             return canonical_name
 
     return None
 
 
 def detect_intent(text: str) -> AnalysisIntent:
-    """Detect the primary analytical intent."""
+    """Detect the primary analytical intent from normalized text."""
 
     normalized = text.casefold().strip()
 
@@ -164,6 +281,7 @@ def detect_intent(text: str) -> AnalysisIntent:
         "null value",
         "empty value",
     ]
+
     if any(term in normalized for term in data_quality_terms):
         return AnalysisIntent.DATA_QUALITY
 
@@ -173,6 +291,7 @@ def detect_intent(text: str) -> AnalysisIntent:
         "association between",
         "related to",
     ]
+
     if any(term in normalized for term in correlation_terms):
         return AnalysisIntent.CORRELATION
 
@@ -183,20 +302,29 @@ def detect_intent(text: str) -> AnalysisIntent:
         "lowest",
         "best",
         "worst",
+        "most",
+        "least",
         "rank",
         "ranking",
     ]
-    if any(_contains(normalized, term) for term in ranking_terms):
+
+    if any(
+        contains_keyword(normalized, term)
+        for term in ranking_terms
+    ):
         return AnalysisIntent.RANKING
 
     trend_terms = [
         "trend",
         "monthly",
         "yearly",
+        "quarterly",
         "annual",
         "over time",
         "change over",
+        "time series",
     ]
+
     if any(term in normalized for term in trend_terms):
         return AnalysisIntent.TREND
 
@@ -206,8 +334,13 @@ def detect_intent(text: str) -> AnalysisIntent:
         "versus",
         "difference between",
     ]
-    if _contains(normalized, "vs") or any(
-        term in normalized for term in comparison_terms
+
+    if (
+        contains_keyword(normalized, "vs")
+        or any(
+            term in normalized
+            for term in comparison_terms
+        )
     ):
         return AnalysisIntent.COMPARISON
 
@@ -217,6 +350,7 @@ def detect_intent(text: str) -> AnalysisIntent:
         "frequency",
         "spread",
     ]
+
     if any(term in normalized for term in distribution_terms):
         return AnalysisIntent.DISTRIBUTION
 
@@ -229,8 +363,13 @@ def detect_intent(text: str) -> AnalysisIntent:
         "overall",
         "sum",
         "analyze",
+        "analysis",
     ]
-    if any(_contains(normalized, term) for term in summary_terms):
+
+    if any(
+        contains_keyword(normalized, term)
+        for term in summary_terms
+    ):
         return AnalysisIntent.SUMMARY
 
     return AnalysisIntent.UNKNOWN
@@ -242,35 +381,67 @@ def extract_limit(text: str) -> int | None:
     patterns = [
         r"\b(?:top|bottom|highest|lowest|best|worst)\s+(\d+)\b",
         r"\b(\d+)\s+(?:products|items|categories|regions|customers)\b",
-        r"(?:အများဆုံး|အနည်းဆုံး|အကောင်းဆုံး|အဆိုးဆုံး)\s*(\d+)",
+        r"(?:အများဆုံး|အနည်းဆုံး|အကောင်းဆုံး|အဆိုးဆုံး).*?(\d+)",
         r"(\d+)\s*(?:မျိုး|ခု|ယောက်)",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
         if match:
             return int(match.group(1))
 
     return None
 
 
-def detect_sort_direction(text: str) -> SortDirection | None:
-    """Determine ranking direction."""
+def detect_sort_direction(
+    text: str,
+) -> SortDirection | None:
+    """Determine whether a ranking is ascending or descending."""
 
-    ascending_terms = ["bottom", "lowest", "worst", "ascending"]
-    descending_terms = ["top", "highest", "best", "descending"]
+    ascending_terms = [
+        "bottom",
+        "lowest",
+        "worst",
+        "least",
+        "ascending",
+        "အနည်းဆုံး",
+        "အဆိုးဆုံး",
+    ]
 
-    if any(_contains(text, term) for term in ascending_terms):
+    descending_terms = [
+        "top",
+        "highest",
+        "best",
+        "most",
+        "descending",
+        "အများဆုံး",
+        "အကောင်းဆုံး",
+    ]
+
+    if any(
+        contains_keyword(text, term)
+        for term in ascending_terms
+    ):
         return SortDirection.ASCENDING
 
-    if any(_contains(text, term) for term in descending_terms):
+    if any(
+        contains_keyword(text, term)
+        for term in descending_terms
+    ):
         return SortDirection.DESCENDING
 
     return None
 
 
-def select_visualization(intent: AnalysisIntent) -> VisualizationType:
-    """Choose a default visualization for the detected intent."""
+def select_visualization(
+    intent: AnalysisIntent,
+) -> VisualizationType:
+    """Choose a default visualization for the analytical intent."""
 
     return {
         AnalysisIntent.SUMMARY: VisualizationType.KPI,
@@ -284,18 +455,23 @@ def select_visualization(intent: AnalysisIntent) -> VisualizationType:
     }[intent]
 
 
-def extract_location_filters(original_text: str) -> list[FilterCondition]:
+def extract_location_filters(
+    original_text: str,
+) -> list[FilterCondition]:
     """Extract known geographic filters from the original question."""
 
     filters: list[FilterCondition] = []
 
-    for location, aliases in LOCATION_KEYWORDS.items():
-        if any(_contains(original_text, alias) for alias in aliases):
+    for canonical_location, aliases in LOCATION_KEYWORDS.items():
+        if any(
+            contains_keyword(original_text, alias)
+            for alias in aliases
+        ):
             filters.append(
                 FilterCondition(
                     column="region",
                     operator="equals",
-                    value=location,
+                    value=canonical_location,
                 )
             )
 
@@ -327,7 +503,7 @@ def calculate_confidence(
     }:
         score += 0.3
 
-    return round(score, 2)
+    return round(min(score, 1.0), 2)
 
 
 def build_warnings(
@@ -336,7 +512,7 @@ def build_warnings(
     dimension: str | None,
     limit: int | None,
 ) -> list[str]:
-    """Build warnings for missing parser fields."""
+    """Create warnings for missing analytical information."""
 
     warnings: list[str] = []
 
@@ -349,17 +525,27 @@ def build_warnings(
         AnalysisIntent.DATA_QUALITY,
         AnalysisIntent.CORRELATION,
     }:
-        warnings.append("No analytical metric was detected.")
+        warnings.append(
+            "No analytical metric was detected."
+        )
 
-    if intent in {
-        AnalysisIntent.RANKING,
-        AnalysisIntent.COMPARISON,
-        AnalysisIntent.TREND,
-        AnalysisIntent.DISTRIBUTION,
-    } and dimension is None:
-        warnings.append("No analysis dimension was detected.")
+    if (
+        intent in {
+            AnalysisIntent.RANKING,
+            AnalysisIntent.COMPARISON,
+            AnalysisIntent.TREND,
+            AnalysisIntent.DISTRIBUTION,
+        }
+        and dimension is None
+    ):
+        warnings.append(
+            "No analysis dimension was detected."
+        )
 
-    if intent == AnalysisIntent.RANKING and limit is None:
+    if (
+        intent == AnalysisIntent.RANKING
+        and limit is None
+    ):
         warnings.append(
             "No ranking limit was provided. Defaulting to 5."
         )
@@ -368,39 +554,55 @@ def build_warnings(
 
 
 def parse_question(question: str) -> AnalysisPlan:
-    """Convert a natural-language question into an AnalysisPlan."""
+    """Convert a natural-language analytics question into AnalysisPlan."""
 
     if not isinstance(question, str):
         raise TypeError("question must be a string")
 
     cleaned_question = question.strip()
+
     if not cleaned_question:
         raise ValueError("Question cannot be empty.")
 
+    # Detect language before the normalizer translates Myanmar terms.
     language = detect_language(cleaned_question)
     normalized_question = normalize_question(cleaned_question)
 
     intent = detect_intent(normalized_question)
+
     metric = find_keyword_mapping(
         normalized_question,
         METRIC_KEYWORDS,
     )
+
     dimension = find_keyword_mapping(
         normalized_question,
         DIMENSION_KEYWORDS,
     )
+
     limit = extract_limit(normalized_question)
     sort_direction = detect_sort_direction(normalized_question)
     filters = extract_location_filters(cleaned_question)
 
+    # A valid metric with no more specific analytical intent is a summary.
+    # Example: "ရန်ကုန်ဒေသ၏ ဝင်ငွေကို ပြပါ"
+    if (
+        intent == AnalysisIntent.UNKNOWN
+        and metric is not None
+    ):
+        intent = AnalysisIntent.SUMMARY
+
     warnings = build_warnings(
-        intent,
-        metric,
-        dimension,
-        limit,
+        intent=intent,
+        metric=metric,
+        dimension=dimension,
+        limit=limit,
     )
 
-    if intent == AnalysisIntent.RANKING and limit is None:
+    if (
+        intent == AnalysisIntent.RANKING
+        and limit is None
+    ):
         limit = 5
 
     return AnalysisPlan(
@@ -416,9 +618,9 @@ def parse_question(question: str) -> AnalysisPlan:
         visualization=select_visualization(intent),
         filters=filters,
         confidence=calculate_confidence(
-            intent,
-            metric,
-            dimension,
+            intent=intent,
+            metric=metric,
+            dimension=dimension,
         ),
         warnings=warnings,
     )
@@ -427,17 +629,19 @@ def parse_question(question: str) -> AnalysisPlan:
 if __name__ == "__main__":
     test_questions = [
         "Show the top 5 products by revenue.",
-        "Analyze missing values and duplicate rows.",
         "Show total revenue.",
+        "Analyze missing values and duplicate rows.",
+        "Show monthly revenue trend.",
         "အမြတ်အများဆုံး ကုန်ပစ္စည်း ၅ ခုကို ပြပါ",
-        "ရန်ကုန်ဒေသ၏ ဝင်ငွေကို ခွဲခြမ်းစိတ်ဖြာပါ",
+        "ရန်ကုန်ဒေသ၏ ဝင်ငွေကို ပြပါ",
+        "Mandalay region အတွက် top 5 products by revenue ပြပါ",
     ]
 
     for test_question in test_questions:
         print("=" * 80)
+        print(f"Question: {test_question}")
         print(
             parse_question(test_question).model_dump_json(
                 indent=2
-
             )
         )
