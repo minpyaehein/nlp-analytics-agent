@@ -55,3 +55,6 @@ sample_data/searchable_sales_report.pdf
 # Local documentation and duplicate demo files
 sample_data/project_guide.docx
 sample_data/searchable_sales_report.pdf
+
+# Generated Power BI workbooks
+powerbi_output/*.xlsx

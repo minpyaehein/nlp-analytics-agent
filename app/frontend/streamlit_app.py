@@ -1,550 +1,605 @@
-"""InsightFlow AI Streamlit app with CSV, XLSX, and PDF ingestion."""
+"""InsightFlow AI Streamlit application with Power BI publication.
+
+Run from the repository root:
+    python -m streamlit run app/frontend/streamlit_app.py
+
+Required project modules:
+    app.agents.ai_planner
+    app.services.powerbi_exporter
+
+The app keeps financial calculations deterministic. Qwen creates only the
+analysis plan; Pandas calculates results after schema and quality validation.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-from core.pdf_analysis_state import (
-    state_matches_dataframe,
-    validate_before_metric,
-    validate_current_pdf_dataframe,
+from app.agents.ai_planner import AIPlannerResult, create_ai_plan
+from app.services.powerbi_exporter import (
+    PowerBIPublication,
+    PowerBIQualityEvidence,
+    PowerBIResponse,
+    PowerBIResultRow,
+    PowerBISourceFile,
+    publish_to_powerbi_workbook,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from app.models.analysis_plan import (
-    AnalysisIntent,
-    AnalysisPlan,
-    FilterCondition,
-    SortDirection,
-    VisualizationType,
-)
-from app.services.chart_generator import generate_chart
-from app.services.filtered_executor import execute_filtered_analysis
-from app.services.hybrid_parser import parse_question_hybrid
-from app.services.text_normalizer import detect_language, normalize_question
-from core.data_profiler import profile_dataframe
-from core.analytics_quality_gate import (
-    validate_profit_readiness,
-    validate_revenue_readiness,
-)
-from core.unified_file_loader import process_uploaded_file
-
-st.set_page_config(
-    page_title="InsightFlow AI",
-    page_icon="📊",
-    layout="wide",
-)
-
-INTENT_MAP = {
-    "summary": AnalysisIntent.SUMMARY,
-    "trend": AnalysisIntent.TREND,
-    "comparison": AnalysisIntent.COMPARISON,
-    "ranking": AnalysisIntent.RANKING,
-    "distribution": AnalysisIntent.DISTRIBUTION,
-    "data_quality": AnalysisIntent.DATA_QUALITY,
-    "correlation": AnalysisIntent.CORRELATION,
-    "unknown": AnalysisIntent.UNKNOWN,
-    "anomaly": AnalysisIntent.UNKNOWN,
-}
-
-VISUALIZATION_MAP = {
-    "kpi": VisualizationType.KPI,
-    "line": VisualizationType.LINE,
-    "bar": VisualizationType.BAR,
-    "histogram": VisualizationType.HISTOGRAM,
-    "scatter": VisualizationType.SCATTER,
-    "table": VisualizationType.TABLE,
-}
-
-SORT_MAP = {
-    "ascending": SortDirection.ASCENDING,
-    "descending": SortDirection.DESCENDING,
-}
-
-EXAMPLE_QUESTIONS = {
-    "Top products by revenue": "Show the top 5 products by revenue.",
-    "Total revenue": "Show total revenue.",
-    "Monthly revenue trend": "Show monthly revenue trend.",
-    "Data quality": "Analyze missing values and duplicate rows.",
-    "Myanmar profit ranking": "အမြတ်အများဆုံး ကုန်ပစ္စည်း ၅ ခုကို ပြပါ",
-    "Myanmar Yangon revenue": "ရန်ကုန်ဒေသ၏ ဝင်ငွေကို ပြပါ",
-}
-
-RESPONSE_LANGUAGES = [
-    "Same as question",
-    "English",
-    "မြန်မာ",
-    "Bilingual",
-]
+try:
+    from core.unified_file_loader import process_uploaded_file
+except ImportError:
+    process_uploaded_file = None
 
 
-def make_arrow_safe(value: Any) -> Any:
-    """Convert nested Python values into Streamlit/PyArrow-safe values."""
-    if isinstance(value, set):
-        value = list(value)
-    if isinstance(value, (list, dict, tuple)):
-        return json.dumps(value, ensure_ascii=False, default=str)
-    if isinstance(value, Path):
-        return str(value)
+POWERBI_PATH = Path("powerbi_output") / "insightflow_powerbi.xlsx"
+SUPPORTED_EXTENSIONS = ["csv", "xlsx", "xls", "json", "txt", "tsv", "docx", "pdf"]
+
+
+@dataclass
+class LoadedDataset:
+    dataframe: pd.DataFrame
+    evidence: dict[str, Any]
+    source_bytes: bytes
+
+
+@dataclass
+class ExecutionResult:
+    result_frame: pd.DataFrame
+    result_rows: list[PowerBIResultRow]
+    filtered_frame: pd.DataFrame
+    quality: PowerBIQualityEvidence
+    answer: str
+    primary_value: float | None
+
+
+def _enum_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _uploaded_bytes(uploaded_file: Any) -> bytes:
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    value = uploaded_file.read()
+    uploaded_file.seek(0)
     return value
 
 
-def arrow_safe_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Return a display-safe DataFrame without changing analytical data."""
-    output = dataframe.copy()
-    for column in output.columns:
-        if output[column].dtype == "object":
-            output[column] = output[column].map(make_arrow_safe)
-    return output
+def _extract_loader_result(result: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Accept DataFrame, tuple, mapping, or project result object."""
+
+    if isinstance(result, pd.DataFrame):
+        return result, {}
+
+    if isinstance(result, tuple):
+        dataframe = next((item for item in result if isinstance(item, pd.DataFrame)), None)
+        evidence = next((item for item in result if isinstance(item, Mapping)), {})
+        if dataframe is not None:
+            return dataframe, dict(evidence)
+
+    if isinstance(result, Mapping):
+        for key in ("dataframe", "df", "table", "data"):
+            if isinstance(result.get(key), pd.DataFrame):
+                evidence = dict(result.get("evidence") or result.get("processing_evidence") or {})
+                return result[key], evidence
+
+    for attribute in ("dataframe", "df", "table", "data"):
+        dataframe = getattr(result, attribute, None)
+        if isinstance(dataframe, pd.DataFrame):
+            evidence = getattr(result, "evidence", None)
+            if evidence is None:
+                evidence = getattr(result, "processing_evidence", {})
+            if hasattr(evidence, "model_dump"):
+                evidence = evidence.model_dump(mode="json")
+            return dataframe, dict(evidence or {})
+
+    raise TypeError("The unified loader did not return a recognizable DataFrame result.")
 
 
-def convert_hybrid_plan(
-    question: str,
-    hybrid_result: dict[str, Any],
-) -> AnalysisPlan:
-    """Convert deterministic or local-Qwen output into AnalysisPlan."""
-    plan_data = hybrid_result["plan"]
-    if "original_question" in plan_data:
-        return AnalysisPlan.model_validate(plan_data)
+def load_uploaded_dataset(uploaded_file: Any) -> LoadedDataset:
+    data = _uploaded_bytes(uploaded_file)
+    suffix = Path(uploaded_file.name).suffix.casefold()
+    evidence: dict[str, Any] = {
+        "filename": uploaded_file.name,
+        "file_type": suffix.lstrip("."),
+        "file_size_bytes": len(data),
+        "source_sha256": _sha256(data),
+        "ocr_executed": False,
+    }
 
-    intent_name = str(plan_data.get("intent", "unknown"))
-    visualization_name = str(plan_data.get("visualization", "table"))
-    sort_name = plan_data.get("sort_direction")
-    metric = plan_data.get("metric")
-    dimension = plan_data.get("dimension")
-    warnings: list[str] = []
-
-    if metric is None and intent_name not in {"data_quality", "correlation"}:
-        warnings.append("The local model did not identify a metric.")
-    if intent_name in {"ranking", "trend", "comparison"} and dimension is None:
-        warnings.append("The local model did not identify a dimension.")
-    if intent_name == "anomaly":
-        warnings.append("Anomaly execution is not implemented yet.")
-
-    return AnalysisPlan(
-        original_question=question.strip(),
-        normalized_question=normalize_question(question),
-        language=detect_language(question),
-        intent=INTENT_MAP.get(intent_name, AnalysisIntent.UNKNOWN),
-        metric=metric,
-        dimension=dimension,
-        aggregation=plan_data.get("aggregation", "sum"),
-        sort_direction=(
-            SORT_MAP.get(str(sort_name)) if sort_name is not None else None
-        ),
-        limit=plan_data.get("limit"),
-        visualization=VISUALIZATION_MAP.get(
-            visualization_name,
-            VisualizationType.TABLE,
-        ),
-        filters=[
-            FilterCondition.model_validate(item)
-            for item in plan_data.get("filters", [])
-        ],
-        confidence=1.0 if not warnings else 0.65,
-        warnings=warnings,
-    )
-
-
-def readiness_is_ready(readiness: dict[str, Any]) -> bool:
-    """Read readiness state consistently across quality-gate versions."""
-    return bool(
-        readiness.get("ready", readiness.get("success", False))
-    )
-
-
-def enforce_metric_quality_gate(
-    plan: AnalysisPlan,
-    dataframe: pd.DataFrame,
-    upload_result: Any,
-) -> dict[str, Any] | None:
-    """Validate the exact current DataFrame before financial calculation.
-
-    PDF/OCR readiness stored in ``upload_result`` is retained as provenance,
-    but it is not trusted as the final calculation gate. This function always
-    recalculates readiness from ``dataframe``, which is the same object passed
-    to the deterministic executor.
-    """
-
-    metric = (plan.metric or "").strip().casefold()
-
-    if metric not in {"revenue", "profit"}:
-        return None
-
-    if metric == "revenue":
-        gate = validate_revenue_readiness(dataframe)
+    if suffix == ".csv":
+        frame = pd.read_csv(io.BytesIO(data))
+    elif suffix in {".xlsx", ".xls"}:
+        engine = "openpyxl" if suffix == ".xlsx" else "xlrd"
+        frame = pd.read_excel(io.BytesIO(data), engine=engine)
+    elif suffix == ".json":
+        frame = pd.read_json(io.BytesIO(data))
+    elif suffix in {".txt", ".tsv"}:
+        delimiter = "\t" if suffix == ".tsv" else None
+        frame = pd.read_csv(io.BytesIO(data), sep=delimiter, engine="python")
     else:
-        gate = validate_profit_readiness(dataframe)
-
-    if not gate.analytics_ready:
-        source_label = str(
-            getattr(upload_result, "source_type", "dataset")
-        ).upper()
-
-        raise ValueError(
-            f"{source_label} extraction is not ready for {metric} "
-            "calculation. Current DataFrame quality gate: "
-            f"{gate.to_dict()}"
-        )
-
-    return gate.to_dict()
-
-
-def display_upload_evidence(upload_result: Any) -> None:
-    """Display PDF/OCR/extraction provenance and readiness evidence."""
-    with st.expander("File Processing Evidence", expanded=False):
-        st.write("**Processing steps**")
-        for index, step in enumerate(upload_result.processing_steps, start=1):
-            st.write(f"{index}. {step}")
-
-        if upload_result.warnings:
-            st.write("**Warnings**")
-            for warning in upload_result.warnings:
-                st.warning(warning)
-
-        if upload_result.source_type == "pdf":
-            source_tab, extraction_tab, readiness_tab = st.tabs(
-                ["PDF/OCR", "Table Extraction", "Quality Gates"]
+        if process_uploaded_file is None:
+            raise RuntimeError(
+                "DOCX/PDF loading requires core.unified_file_loader.process_uploaded_file()."
             )
-            with source_tab:
-                st.json(upload_result.source_metadata)
-            with extraction_tab:
-                st.json(upload_result.extraction_metadata)
-            with readiness_tab:
-                col_1, col_2 = st.columns(2)
-                with col_1:
-                    st.write("**Revenue readiness**")
-                    st.json(upload_result.revenue_readiness)
-                with col_2:
-                    st.write("**Profit readiness**")
-                    st.json(upload_result.profit_readiness)
+        frame, loader_evidence = _extract_loader_result(
+            process_uploaded_file(
+                data,
+                uploaded_file.name,
+            )
+        )
+        evidence.update(loader_evidence)
 
-    if (
-        upload_result.source_type == "pdf"
-        and upload_result.searchable_pdf_bytes
-    ):
-        st.download_button(
-            "Download Searchable PDF",
-            data=upload_result.searchable_pdf_bytes,
-            file_name=(
-                Path(upload_result.filename).stem + "_searchable.pdf"
-            ),
-            mime="application/pdf",
-            width="content",
+    frame.columns = [str(column).strip() for column in frame.columns]
+    frame = frame.dropna(how="all").reset_index(drop=True)
+    evidence.setdefault("row_count", int(len(frame)))
+    evidence.setdefault("column_count", int(len(frame.columns)))
+    evidence.setdefault("duplicate_rows", int(frame.duplicated().sum()))
+    evidence.setdefault("missing_values", int(frame.isna().sum().sum()))
+    return LoadedDataset(frame, evidence, data)
+
+
+def _column_map(frame: pd.DataFrame) -> dict[str, str]:
+    return {str(column).strip().casefold(): str(column) for column in frame.columns}
+
+
+def _derived_metric(frame: pd.DataFrame, metric: str) -> tuple[pd.Series, tuple[str, ...]]:
+    columns = _column_map(frame)
+    metric_key = metric.casefold()
+
+    if metric_key in columns:
+        column = columns[metric_key]
+        return pd.to_numeric(frame[column], errors="coerce"), (column,)
+
+    if metric_key == "revenue":
+        required = ("quantity", "unit_price")
+        if not all(name in columns for name in required):
+            raise ValueError("Revenue requires quantity and unit_price columns.")
+        quantity = pd.to_numeric(frame[columns["quantity"]], errors="coerce")
+        unit_price = pd.to_numeric(frame[columns["unit_price"]], errors="coerce")
+        return quantity * unit_price, (columns["quantity"], columns["unit_price"])
+
+    if metric_key == "profit":
+        required = ("quantity", "unit_price", "unit_cost")
+        if not all(name in columns for name in required):
+            raise ValueError("Profit requires quantity, unit_price, and unit_cost columns.")
+        quantity = pd.to_numeric(frame[columns["quantity"]], errors="coerce")
+        unit_price = pd.to_numeric(frame[columns["unit_price"]], errors="coerce")
+        unit_cost = pd.to_numeric(frame[columns["unit_cost"]], errors="coerce")
+        return quantity * (unit_price - unit_cost), (
+            columns["quantity"], columns["unit_price"], columns["unit_cost"]
         )
 
-
-def display_chart(
-    records: list[dict[str, Any]],
-    plan: AnalysisPlan,
-) -> None:
-    """Generate, validate, display, and export a Plotly chart."""
-    if not records or plan.visualization == VisualizationType.TABLE:
-        return
-
-    try:
-        chart = generate_chart(records, plan)
-    except Exception as error:
-        st.warning(f"Chart generation was skipped: {error}")
-        return
-
-    if not chart.success or chart.figure is None:
-        for warning in chart.warnings:
-            st.warning(warning)
-        return
-
-    st.subheader("Automatic Visualization")
-    st.plotly_chart(
-        chart.figure,
-        width="stretch",
-        config={"displaylogo": False, "responsive": True},
-    )
-    st.download_button(
-        "Download Chart HTML",
-        data=chart.figure.to_html(
-            full_html=True,
-            include_plotlyjs="cdn",
-        ).encode("utf-8"),
-        file_name="insightflow_chart.html",
-        mime="text/html",
-        width="content",
-    )
-    with st.expander("Chart Validation"):
-        st.json(chart.metadata())
+    raise ValueError(f"Metric '{metric}' is not grounded to the dataset.")
 
 
-def display_analysis_result(
-    result: Any,
-    plan: AnalysisPlan,
-    parser_source: str,
-) -> None:
-    """Display results, charts, filters, evidence, and downloads."""
-    analysis = result.analysis
-    records = analysis.get("result", [])
-    result_dataframe = arrow_safe_dataframe(pd.DataFrame(records))
-    source_label = {
-        "rule_based": "Deterministic rule parser",
-        "local_llm": "Local Qwen3 4B fallback",
-        "rule_based_fallback": "Rule parser after LLM failure",
-    }.get(parser_source, parser_source)
+def _filter_value(series: pd.Series, operator: str, value: Any) -> pd.Series:
+    if operator == "equals":
+        return series.astype(str).str.casefold() == str(value).casefold()
+    if operator == "not_equals":
+        return series.astype(str).str.casefold() != str(value).casefold()
+    if operator == "contains":
+        return series.astype(str).str.contains(str(value), case=False, na=False, regex=False)
+    if operator == "in":
+        values = value if isinstance(value, Sequence) and not isinstance(value, str) else [value]
+        normalized = {str(item).casefold() for item in values}
+        return series.astype(str).str.casefold().isin(normalized)
 
-    st.subheader("Analysis Result")
-    col_1, col_2, col_3, col_4 = st.columns(4)
-    col_1.metric("Parser source", source_label)
-    col_2.metric("Intent", plan.intent.value)
-    col_3.metric("Source rows", f"{result.source_rows:,}")
-    col_4.metric("Filtered rows", f"{result.filtered_rows:,}")
+    numeric = pd.to_numeric(series, errors="coerce")
+    if operator == "greater_than":
+        return numeric > float(value)
+    if operator == "greater_than_or_equal":
+        return numeric >= float(value)
+    if operator == "less_than":
+        return numeric < float(value)
+    if operator == "less_than_or_equal":
+        return numeric <= float(value)
+    if operator == "between":
+        low, high = value
+        return numeric.between(float(low), float(high), inclusive="both")
+    raise ValueError(f"Unsupported filter operator: {operator}")
 
-    if len(records) == 1 and isinstance(records[0].get("value"), (int, float)):
-        value = float(records[0]["value"])
-        st.metric(
-            (plan.metric or "Result").replace("_", " ").title(),
-            f"{value:,.0f}" if value.is_integer() else f"{value:,.2f}",
+
+def apply_plan_filters(frame: pd.DataFrame, filters: Sequence[Any]) -> pd.DataFrame:
+    filtered = frame.copy()
+    columns = _column_map(filtered)
+    for condition in filters:
+        condition_data = (
+            condition.model_dump(mode="python")
+            if hasattr(condition, "model_dump")
+            else dict(condition)
+        )
+        column_key = str(condition_data["column"]).casefold()
+        if column_key not in columns:
+            raise ValueError(f"Filter column '{condition_data['column']}' does not exist.")
+        column = columns[column_key]
+        mask = _filter_value(
+            filtered[column],
+            str(condition_data.get("operator", "equals")),
+            condition_data.get("value"),
+        )
+        filtered = filtered.loc[mask].copy()
+    return filtered.reset_index(drop=True)
+
+
+def validate_metric_quality(
+    frame: pd.DataFrame,
+    metric_values: pd.Series,
+    required_columns: Sequence[str],
+    metric: str,
+) -> PowerBIQualityEvidence:
+    total_rows = len(frame)
+    usable_rows = int(metric_values.notna().sum())
+    usable_ratio = usable_rows / total_rows if total_rows else 0.0
+    ready = total_rows > 0 and usable_ratio >= 0.80
+    warnings: list[str] = []
+    duplicate_rows = int(frame.duplicated().sum())
+    missing_values = int(frame[list(required_columns)].isna().sum().sum())
+
+    if duplicate_rows:
+        warnings.append(f"{duplicate_rows} duplicate source row(s) were retained.")
+    if usable_ratio < 1.0:
+        warnings.append(
+            f"Only {usable_ratio:.1%} of rows contain usable numeric evidence for {metric}."
         )
 
-    if not result_dataframe.empty:
-        st.dataframe(result_dataframe, width="stretch", hide_index=True)
-        st.download_button(
-            "Download Result CSV",
-            data=result_dataframe.to_csv(index=False).encode("utf-8-sig"),
-            file_name="insightflow_analysis_result.csv",
-            mime="text/csv",
-            width="content",
+    return PowerBIQualityEvidence(
+        gate_name=metric,
+        ready=ready,
+        duplicate_rows=duplicate_rows,
+        missing_values=missing_values,
+        usable_numeric_ratio=usable_ratio,
+        validation_status="passed" if ready else "blocked",
+        warnings=tuple(warnings),
+        evidence={
+            "required_columns": list(required_columns),
+            "source_rows": total_rows,
+            "usable_rows": usable_rows,
+        },
+    )
+
+
+def execute_validated_plan(frame: pd.DataFrame, plan: Any) -> ExecutionResult:
+    if bool(getattr(plan, "requires_clarification", False)):
+        raise ValueError(getattr(plan, "clarification_question", "Clarification is required."))
+
+    filtered = apply_plan_filters(frame, getattr(plan, "filters", []))
+    metric = _enum_text(getattr(plan, "metric", None))
+    if not metric:
+        raise ValueError("The plan does not contain a metric.")
+
+    metric_values, required_columns = _derived_metric(filtered, metric)
+    quality = validate_metric_quality(filtered, metric_values, required_columns, metric)
+    if not quality.ready:
+        raise ValueError(
+            f"{metric.title()} calculation was blocked because the current DataFrame "
+            "does not contain enough usable numeric evidence."
         )
 
-    display_chart(records, plan)
+    working = filtered.copy()
+    working["__metric_value__"] = metric_values
+    intent = _enum_text(getattr(plan, "intent", "summary")) or "summary"
+    aggregation = _enum_text(getattr(plan, "aggregation", "sum")) or "sum"
+    dimension = _enum_text(getattr(plan, "dimension", None))
 
-    if result.applied_filters:
-        st.subheader("Applied Filters")
-        st.dataframe(
-            arrow_safe_dataframe(pd.DataFrame(result.applied_filters)),
-            width="stretch",
-            hide_index=True,
+    aggregate_function = {
+        "sum": "sum",
+        "mean": "mean",
+        "count": "count",
+        "min": "min",
+        "max": "max",
+    }.get(aggregation)
+    if not aggregate_function:
+        raise ValueError(f"Unsupported aggregation: {aggregation}")
+
+    if intent == "summary":
+        value = getattr(working["__metric_value__"], aggregate_function)()
+        result_frame = pd.DataFrame(
+            [{"label": f"Total {metric}", "value": float(value), "rank": None}]
         )
-
-    for warning in result.filter_warnings:
-        st.warning(warning)
-    for warning in analysis.get("warnings", []):
-        st.warning(warning)
-
-    with st.expander("Calculation and Validation Evidence"):
-        st.write("**Calculation:**", analysis.get("calculation") or "N/A")
-        st.json(analysis.get("validation", {}))
-    with st.expander("Detected Analysis Plan"):
-        st.json(plan.model_dump(mode="json"))
-
-
-st.title("InsightFlow AI")
-st.subheader("Bilingual NLP-Based Data Analytics Agent")
-st.write(
-    "Upload CSV, Excel, or PDF. Scanned PDFs are OCR-processed "
-    "automatically before validated table analytics."
-)
-
-with st.sidebar:
-    st.header("PDF Processing")
-    ocr_language = st.selectbox(
-        "OCR language",
-        ["eng+mya", "eng", "mya"],
-        help="Use eng+mya for bilingual English and Myanmar PDFs.",
-        width="stretch",
-    )
-    st.caption(
-        "PDF calculations are blocked when required OCR fields fail "
-        "the revenue or profit quality gate."
-    )
-
-uploaded_file = st.file_uploader(
-    "Upload a dataset or report",
-    type=["csv", "xlsx", "pdf"],
-    help="Supported formats: CSV, XLSX, searchable PDF, scanned PDF.",
-    width="stretch",
-)
-
-if uploaded_file is None:
-    st.info("Upload a CSV, XLSX, or PDF file to begin.")
-    st.stop()
-
-try:
-    spinner_text = (
-        "Inspecting the PDF, running OCR if required, and extracting tables..."
-        if uploaded_file.name.casefold().endswith(".pdf")
-        else "Loading and validating the tabular dataset..."
-    )
-    with st.spinner(spinner_text):
-        upload_result = process_uploaded_file(
-            uploaded_file,
-            uploaded_file.name,
-            ocr_language=ocr_language,
-            timeout_seconds=600,
+        answer = f"Validated {aggregation} {metric}: {float(value):,.2f}."
+        primary_value = float(value)
+    elif intent in {"ranking", "comparison", "trend"}:
+        if not dimension:
+            raise ValueError(f"Intent '{intent}' requires a dimension.")
+        columns = _column_map(working)
+        dimension_key = dimension.casefold()
+        if dimension_key not in columns:
+            if intent == "trend" and "order_date" in columns:
+                dimension_key = "order_date"
+            else:
+                raise ValueError(f"Dimension '{dimension}' does not exist in the dataset.")
+        dimension_column = columns[dimension_key]
+        grouped = (
+            working.groupby(dimension_column, dropna=False)["__metric_value__"]
+            .agg(aggregate_function)
+            .reset_index()
         )
-except Exception as error:
-    st.error(f"File processing failed: {error}")
-    st.stop()
-
-if not upload_result.success or upload_result.dataframe.empty:
-    st.error("The uploaded file did not produce a usable table.")
-    st.stop()
-
-dataframe = upload_result.dataframe
-profile = profile_dataframe(dataframe)
-
-st.success(
-    f"Loaded {upload_result.filename} as {upload_result.source_type.upper()}."
-)
-
-metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-metric_1.metric("Rows", f"{profile['row_count']:,}")
-metric_2.metric("Columns", f"{profile['column_count']:,}")
-metric_3.metric("Duplicate rows", f"{profile['duplicate_rows']:,}")
-metric_4.metric("Quality score", f"{profile['quality_score']}%")
-
-display_upload_evidence(upload_result)
-
-preview_tab, quality_tab, ask_tab = st.tabs(
-    ["Dataset Preview", "Data Quality", "Ask InsightFlow AI"]
-)
-
-with preview_tab:
-    st.dataframe(
-        arrow_safe_dataframe(dataframe.head(100)),
-        width="stretch",
-        hide_index=True,
-    )
-
-with quality_tab:
-    st.write("### Detected Schema")
-    st.dataframe(
-        arrow_safe_dataframe(pd.DataFrame(profile["columns"])),
-        width="stretch",
-        hide_index=True,
-    )
-    missing_dataframe = pd.DataFrame(
-        {
-            "column": profile["missing_by_column"].keys(),
-            "missing_count": profile["missing_by_column"].values(),
-        }
-    )
-    missing_dataframe["missing_percentage"] = (
-        missing_dataframe["missing_count"]
-        / max(profile["row_count"], 1)
-        * 100
-    ).round(2)
-    st.write("### Missing Values")
-    st.dataframe(
-        missing_dataframe.sort_values("missing_count", ascending=False),
-        width="stretch",
-        hide_index=True,
-    )
-    with st.expander("Complete Profile JSON"):
-        st.json(profile)
-
-with ask_tab:
-    selected_example = st.selectbox(
-        "Example question",
-        list(EXAMPLE_QUESTIONS),
-        width="stretch",
-    )
-    if "question_text" not in st.session_state:
-        st.session_state.question_text = EXAMPLE_QUESTIONS[selected_example]
-    if st.button("Use Selected Example", width="content"):
-        st.session_state.question_text = EXAMPLE_QUESTIONS[selected_example]
-
-    question = st.text_area(
-        "Describe your analytical problem",
-        key="question_text",
-        height=120,
-        placeholder="Example: ရန်ကုန်ဒေသ၏ ဝင်ငွေကို ပြပါ",
-        width="stretch",
-    )
-    response_language = st.selectbox(
-        "Response language",
-        RESPONSE_LANGUAGES,
-        width="stretch",
-    )
-
-    if st.button("Analyze", type="primary", width="content"):
-        if not question.strip():
-            st.warning("Enter an analytical problem before continuing.")
+        grouped.columns = ["label", "value"]
+        ascending = _enum_text(getattr(plan, "sort_direction", None)) == "ascending"
+        if intent == "trend":
+            grouped = grouped.sort_values("label", ascending=True)
         else:
+            grouped = grouped.sort_values("value", ascending=ascending)
+        limit = getattr(plan, "limit", None)
+        if limit:
+            grouped = grouped.head(int(limit))
+        grouped = grouped.reset_index(drop=True)
+        grouped["rank"] = range(1, len(grouped) + 1)
+        result_frame = grouped
+        top = result_frame.iloc[0]
+        answer = f"Top validated {dimension}: {top['label']} with {float(top['value']):,.2f} {metric}."
+        primary_value = float(top["value"])
+    elif intent == "distribution":
+        values = working["__metric_value__"].dropna()
+        counts, edges = pd.cut(values, bins=min(10, max(1, values.nunique())), duplicates="drop", retbins=True)
+        result_frame = counts.value_counts(sort=False).rename_axis("label").reset_index(name="value")
+        result_frame["label"] = result_frame["label"].astype(str)
+        result_frame["rank"] = range(1, len(result_frame) + 1)
+        answer = f"Generated a validated distribution for {metric}."
+        primary_value = None
+    else:
+        raise ValueError(f"Intent '{intent}' is not supported by this Streamlit executor.")
+
+    result_rows = [
+        PowerBIResultRow(
+            label=str(row["label"]),
+            value=float(row["value"]),
+            rank=int(row["rank"]) if pd.notna(row.get("rank")) else None,
+        )
+        for row in result_frame.to_dict(orient="records")
+    ]
+    return ExecutionResult(result_frame, result_rows, filtered, quality, answer, primary_value)
+
+
+def render_chart(result: ExecutionResult, plan: Any) -> None:
+    visualization = _enum_text(getattr(plan, "visualization", "table")) or "table"
+    metric = _enum_text(getattr(plan, "metric", "value")) or "value"
+
+    if visualization == "kpi" and result.primary_value is not None:
+        st.metric(f"Validated {metric.title()}", f"{result.primary_value:,.2f}")
+    elif visualization in {"bar", "histogram"}:
+        figure = px.bar(
+            result.result_frame,
+            x="label",
+            y="value",
+            title=f"Validated {metric.title()} Analysis",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+    elif visualization == "line":
+        figure = px.line(
+            result.result_frame,
+            x="label",
+            y="value",
+            markers=True,
+            title=f"Validated {metric.title()} Trend",
+        )
+        st.plotly_chart(figure, use_container_width=True)
+
+    st.dataframe(result.result_frame, use_container_width=True, hide_index=True)
+
+
+def source_file_record(loaded: LoadedDataset) -> PowerBISourceFile:
+    evidence = loaded.evidence
+    return PowerBISourceFile(
+        filename=str(evidence.get("filename", "")),
+        file_type=str(evidence.get("file_type", "")),
+        file_size_bytes=evidence.get("file_size_bytes"),
+        page_count=evidence.get("page_count"),
+        ocr_executed=bool(evidence.get("ocr_executed", False)),
+        ocr_languages=str(evidence.get("ocr_languages", "")),
+        extraction_strategy=str(evidence.get("extraction_strategy", "")),
+        extraction_confidence=evidence.get("extraction_confidence"),
+        source_sha256=str(evidence.get("source_sha256", "")),
+    )
+
+
+def publish_current_result(
+    question: str,
+    planner_result: AIPlannerResult,
+    execution: ExecutionResult,
+    loaded: LoadedDataset,
+) -> Any:
+    plan = planner_result.plan
+    tool_steps = [
+        step.model_dump(mode="json") if hasattr(step, "model_dump") else dict(step)
+        for step in getattr(plan, "tool_steps", [])
+    ]
+    publication = PowerBIPublication(
+        question=question,
+        planner_source=planner_result.source,
+        model_name=planner_result.model,
+        intent=_enum_text(plan.intent) or "unknown",
+        metric=_enum_text(plan.metric),
+        dimension=_enum_text(plan.dimension),
+        aggregation=_enum_text(plan.aggregation) or "sum",
+        sort_direction=_enum_text(plan.sort_direction),
+        result_limit=plan.limit,
+        visualization=_enum_text(plan.visualization) or "table",
+        confidence=plan.confidence,
+        source_rows=len(loaded.dataframe),
+        filtered_rows=len(execution.filtered_frame),
+        validation_status=execution.quality.validation_status,
+        quality_ready=execution.quality.ready,
+        results=tuple(execution.result_rows),
+        ai_response=PowerBIResponse(
+            language=_enum_text(plan.language) or "en",
+            answer=execution.answer,
+            primary_finding=execution.answer,
+            calculation=(
+                "Revenue = quantity * unit_price"
+                if _enum_text(plan.metric) == "revenue"
+                else "Profit = quantity * (unit_price - unit_cost)"
+                if _enum_text(plan.metric) == "profit"
+                else f"{_enum_text(plan.aggregation)}({_enum_text(plan.metric)})"
+            ),
+            limitations="; ".join(execution.quality.warnings),
+        ),
+        quality=(execution.quality,),
+        source_files=(source_file_record(loaded),),
+        reasoning_summary=str(plan.reasoning_summary),
+        assumptions=tuple(plan.assumptions),
+        tool_steps=tuple(tool_steps),
+    )
+    return publish_to_powerbi_workbook(publication, POWERBI_PATH)
+
+
+def initialize_state() -> None:
+    defaults = {
+        "loaded_dataset": None,
+        "planner_result": None,
+        "execution_result": None,
+        "current_question": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="InsightFlow AI",
+        page_icon="📊",
+        layout="wide",
+    )
+    initialize_state()
+
+    st.title("InsightFlow AI")
+    st.caption(
+        "Bilingual document analytics with local Qwen planning, deterministic "
+        "execution, OCR quality gates, and Power BI publication."
+    )
+
+    with st.sidebar:
+        st.header("Data Source")
+        uploaded_file = st.file_uploader(
+            "Upload a data or document file",
+            type=SUPPORTED_EXTENSIONS,
+        )
+        if uploaded_file and st.button("Process file", use_container_width=True):
             try:
-                with st.spinner("Planning and executing validated analysis..."):
-                    hybrid_result = parse_question_hybrid(question)
-                    plan = convert_hybrid_plan(question, hybrid_result)
-                    if plan.intent == AnalysisIntent.UNKNOWN:
-                        raise ValueError(
-                            "The request could not be converted into a "
-                            "supported analytical operation."
-                        )
-                    current_quality_gate = enforce_metric_quality_gate(
-                        plan=plan,
-                        dataframe=dataframe,
-                        upload_result=upload_result,
-                    )
-
-                    if current_quality_gate is not None:
-                        if not hasattr(upload_result, "evidence"):
-                            pass
-                        elif isinstance(upload_result.evidence, dict):
-                            upload_result.evidence[
-                                "pre_analysis_quality_gate"
-                            ] = current_quality_gate
-
-                    execution_result = execute_filtered_analysis(
-                        dataframe,
-                        plan,
-                    )
-
-                st.success("Analysis completed successfully.")
-                st.caption(f"Selected response language: {response_language}")
-                display_analysis_result(
-                    execution_result,
-                    plan,
-                    hybrid_result["source"],
-                )
-                if hybrid_result.get("llm_error"):
-                    st.warning(
-                        "The local LLM was unavailable; the rule-based plan "
-                        f"was used. Details: {hybrid_result['llm_error']}"
-                    )
-            except ValueError as error:
-                message = str(error)
-
-                quality_gate_failure = (
-                    "not safe for the requested calculation" in message
-                    or "PDF extraction is not ready" in message
-                    or "quality_gate" in message
-                    or "analytics_ready" in message
-                )
-
-                if quality_gate_failure:
-                    st.error(
-                        "Revenue or profit calculation was blocked because "
-                        "the reconstructed PDF table does not contain enough "
-                        "usable numeric evidence."
-                    )
-                    st.warning(
-                        "Reset the previous OCR result, upload the high-resolution "
-                        "scan, rerun OCR, and confirm that the Revenue and Profit "
-                        "quality gates are ready before analyzing."
-                    )
-                    with st.expander("Technical quality-gate details"):
-                        st.code(message)
-                else:
-                    st.error(f"Analysis failed: {message}")
-
+                with st.spinner("Extracting and validating the uploaded file..."):
+                    st.session_state.loaded_dataset = load_uploaded_dataset(uploaded_file)
+                    st.session_state.planner_result = None
+                    st.session_state.execution_result = None
+                st.success("File processed.")
             except Exception as error:
-                st.error(f"Analysis failed: {error}")
-                st.info(
-                    "Inspect File Processing Evidence and Quality Gates, "
-                    "then use a clearer supported question."
+                st.error(f"File processing failed: {error}")
+
+        st.divider()
+        st.header("Power BI")
+        st.code(str(POWERBI_PATH), language=None)
+        if POWERBI_PATH.exists():
+            st.download_button(
+                "Download Power BI workbook",
+                data=POWERBI_PATH.read_bytes(),
+                file_name=POWERBI_PATH.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    loaded: LoadedDataset | None = st.session_state.loaded_dataset
+    if loaded is None:
+        st.info("Upload a supported file and select Process file to begin.")
+        return
+
+    profile_col, evidence_col = st.columns([2, 1])
+    with profile_col:
+        st.subheader("Dataset Preview")
+        st.dataframe(loaded.dataframe.head(100), use_container_width=True, hide_index=True)
+    with evidence_col:
+        st.subheader("Processing Evidence")
+        st.metric("Rows", len(loaded.dataframe))
+        st.metric("Columns", len(loaded.dataframe.columns))
+        st.metric("Duplicate rows", int(loaded.dataframe.duplicated().sum()))
+        with st.expander("Evidence JSON"):
+            st.json(loaded.evidence)
+
+    st.divider()
+    st.subheader("Ask InsightFlow AI")
+    question = st.text_input(
+        "English, Myanmar, or mixed-language analytical question",
+        value=st.session_state.current_question,
+        placeholder="Show the top 5 products by revenue.",
+    )
+
+    if st.button("Analyze", type="primary"):
+        try:
+            with st.spinner("Creating a grounded plan and calculating deterministically..."):
+                planner_result = create_ai_plan(question, loaded.dataframe)
+                if planner_result.plan.requires_clarification:
+                    st.session_state.planner_result = planner_result
+                    st.session_state.execution_result = None
+                else:
+                    execution = execute_validated_plan(loaded.dataframe, planner_result.plan)
+                    st.session_state.planner_result = planner_result
+                    st.session_state.execution_result = execution
+                st.session_state.current_question = question
+        except Exception as error:
+            st.error(f"Analysis failed: {error}")
+
+    planner_result: AIPlannerResult | None = st.session_state.planner_result
+    execution: ExecutionResult | None = st.session_state.execution_result
+    if planner_result is None:
+        return
+
+    plan = planner_result.plan
+    if plan.requires_clarification:
+        st.warning(plan.clarification_question or "Please clarify the analytical request.")
+        return
+
+    st.success(execution.answer if execution else "Validated analysis completed.")
+    plan_col, quality_col = st.columns(2)
+    with plan_col:
+        st.subheader("Grounded Plan")
+        st.json(planner_result.metadata())
+    with quality_col:
+        st.subheader("Quality Gate")
+        st.json(execution.quality.__dict__ if execution else {})
+
+    if execution:
+        render_chart(execution, plan)
+
+        st.divider()
+        st.subheader("Power BI Publication")
+        st.caption(
+            "Only the deterministic result and validation evidence are written "
+            "to the Power BI workbook."
+        )
+        if st.button("Publish to Power BI", type="primary", use_container_width=True):
+            try:
+                published = publish_current_result(
+                    st.session_state.current_question,
+                    planner_result,
+                    execution,
+                    loaded,
                 )
+                if published.duplicate:
+                    st.info(f"This result is already published. Run ID: {published.run_id}")
+                else:
+                    st.success(
+                        f"Published {published.result_rows_written} result row(s). "
+                        f"Run ID: {published.run_id}"
+                    )
+                st.code(str(published.workbook_path), language=None)
+                st.caption("Open Power BI Desktop and select Home > Refresh.")
+            except Exception as error:
+                st.error(f"Power BI publication failed: {error}")
+
+
+if __name__ == "__main__":
+    main()
