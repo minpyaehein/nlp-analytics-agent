@@ -33,3 +33,8 @@ sample_data/extracted_pdf_sales*.csv
 backups/
 *.before_default_fix
 *.before_pymupdf
+
+# Local repair backups
+backups/
+*.before_default_fix
+*.before_pymupdf

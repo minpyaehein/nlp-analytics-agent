@@ -623,15 +623,41 @@ def plan_with_qwen(
             "The local Ollama server is unavailable."
         )
 
+    columns = [str(column) for column in dataframe.columns]
+    column_types = {
+        str(column): str(dtype)
+        for column, dtype in dataframe.dtypes.items()
+    }
+
     payload = {
-        "user_question": question.strip(),
-        "dataset_context": build_dataset_context(dataframe),
+        "question": question.strip(),
+        "available_columns": columns,
+        "column_types": column_types,
+        "row_count": int(len(dataframe)),
     }
 
     user_content = (
-        "Create the analysis plan for this request and dataset "
-        "context. Return only the plan object and do not repeat "
-        "the input.\n\n"
+        "Return exactly one analytics-plan JSON object. "
+        "Do not repeat the input payload. "
+        "Do not return dataset rows, sample values, column profiles, "
+        "dataset context, Markdown, prose, or explanations. "
+        "Do not calculate result values. "
+        "For one total or aggregate, use intent='summary'. "
+        "For top, bottom, highest, lowest, best, or worst requests, "
+        "use intent='ranking'. "
+        "For a request over time, use intent='trend'. "
+        "For missing values or duplicates, use intent='data_quality'. "
+        "For 'top 5 products by revenue', use metric='revenue', "
+        "dimension='product', aggregation='sum', limit=5, "
+        "sort_direction='descending', and visualization='bar'. "
+        "For 'total revenue', use intent='summary', metric='revenue', "
+        "dimension=null, aggregation='sum', limit=null, "
+        "sort_direction=null, and visualization='kpi'. "
+        "Required output fields are requires_clarification, "
+        "clarification_question, language, intent, metric, dimension, "
+        "aggregation, filters, sort_direction, limit, visualization, "
+        "tool_steps, reasoning_summary, assumptions, and confidence."
+        "\n\nPlanning input:\n"
         + json.dumps(
             payload,
             ensure_ascii=False,
@@ -652,15 +678,17 @@ def plan_with_qwen(
             },
         ],
         format="json",
+        think=False,
         options={
             "temperature": 0,
             "seed": 42,
             "top_p": 0.1,
-            "num_predict": 768,
+            "num_predict": 512,
         },
     )
 
     content = _response_content(response)
+
 
     if not content:
         raise RuntimeError(
