@@ -5,3 +5,26 @@ __pycache__/
 output/*
 !output/.gitkeep
 .streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# Streamlit local configuration
+.streamlit/
+
+# Development backups
+backups/
+*_backup.py.txt
+
+# OCR diagnostic outputs
+sample_data/*_words.csv
+sample_data/extracted_pdf_sales*.csv
+
+# Temporary files
+*.tmp
+*.log
