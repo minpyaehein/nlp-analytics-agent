@@ -38,3 +38,8 @@ backups/
 backups/
 *.before_default_fix
 *.before_pymupdf
+
+
+# Local project documentation and duplicate demo outputs
+sample_data/project_guide.docx
+sample_data/searchable_sales_report.pdf
