@@ -28,3 +28,8 @@ sample_data/extracted_pdf_sales*.csv
 # Temporary files
 *.tmp
 *.log
+
+# Local repair backups
+backups/
+*.before_default_fix
+*.before_pymupdf
