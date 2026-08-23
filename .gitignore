@@ -43,3 +43,7 @@ backups/
 # Local project documentation and duplicate demo outputs
 sample_data/project_guide.docx
 sample_data/searchable_sales_report.pdf
+
+# Local project documentation and duplicate demo files
+sample_data/project_guide.docx
+sample_data/searchable_sales_report.pdf
