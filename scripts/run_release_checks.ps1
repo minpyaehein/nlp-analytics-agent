@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "InsightFlow AI Release Checks" -ForegroundColor Cyan
@@ -68,7 +68,16 @@ $ollamaCommand = Get-Command `
 
 if ($ollamaCommand) {
     ollama --version
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Ollama was found but did not return its version."
+    }
+
     ollama list
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Ollama was found but the model list was unavailable."
+    }
 }
 else {
     Write-Host (
