@@ -14,6 +14,12 @@ from app.models.analysis_plan import (
 )
 from app.services.schema_linker import link_analysis_plan
 
+from core.analytics_quality_gate import (
+    require_profit_ready,
+    require_revenue_ready,
+)
+
+
 
 @dataclass
 class ExecutionResult:
@@ -128,6 +134,17 @@ def create_metric_series(
             )
 
         if metric_name == "revenue":
+
+            require_revenue_ready(
+
+                dataframe=df,
+
+                minimum_usable_ratio=0.80,
+
+                maximum_missing_ratio=0.20,
+
+            )
+
             quantity_column, price_column = required_columns
 
             quantity = _ensure_numeric(
@@ -145,6 +162,17 @@ def create_metric_series(
             )
 
         if metric_name == "profit":
+
+            require_profit_ready(
+
+                dataframe=df,
+
+                minimum_usable_ratio=0.80,
+
+                maximum_missing_ratio=0.20,
+
+            )
+
             quantity_column, price_column, cost_column = required_columns
 
             quantity = _ensure_numeric(
